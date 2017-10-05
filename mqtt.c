@@ -234,25 +234,25 @@ int _mqtt_mbedtls_write(mqtt_client *client, const void *buffer, int len, int ti
         setsockopt(client->server_fd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-	ESP_LOGD(TAG, "Sending %d bytes of data", len);
-	do {
-		if(&client->ssl == NULL) return written_bytes;
-		result = mbedtls_ssl_write(&client->ssl, (const unsigned char *) buffer + written_bytes, len - written_bytes);
-		if (result >= 0) {
-			ESP_LOGD(TAG, "%d bytes written", result);
-			written_bytes += result;
-		} else if (result != MBEDTLS_ERR_SSL_WANT_WRITE && result != MBEDTLS_ERR_SSL_WANT_READ) {
-			ESP_LOGE(TAG, "mbedtls_ssl_write returned -0x%x", -result);
-			_mqtt_mbedtls_cleanup(client, result);
-			return -1;
-		}
-	} while (written_bytes < len);
+    ESP_LOGD(TAG, "Sending %d bytes of data", len);
+    do {
+	    if(&client->ssl == NULL) return written_bytes;
+	    result = mbedtls_ssl_write(&client->ssl, (const unsigned char *) buffer + written_bytes, len - written_bytes);
+	    if (result >= 0) {
+		    ESP_LOGD(TAG, "%d bytes written", result);
+		    written_bytes += result;
+	    } else if (result != MBEDTLS_ERR_SSL_WANT_WRITE && result != MBEDTLS_ERR_SSL_WANT_READ) {
+		    ESP_LOGE(TAG, "mbedtls_ssl_write returned -0x%x", -result);
+		    _mqtt_mbedtls_cleanup(client, result);
+		    return -1;
+	    }
+    } while (written_bytes < len);
 
-	if (timeout_ms > 0) {
-		tv.tv_sec = 0;
-		tv.tv_usec = 0;
-		setsockopt(client->server_fd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-	}
+    if (result > 0 && timeout_ms > 0) {
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        setsockopt(client->server_fd.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
 
     return written_bytes;
 }
@@ -336,10 +336,12 @@ void mqtt_sending_task(void *pvParameters)
             //queue available
             while (msg_len > 0) {
                 send_len = msg_len;
-                if (send_len > CONFIG_MQTT_BUFFER_SIZE_BYTE)
+                if (send_len > CONFIG_MQTT_BUFFER_SIZE_BYTE) {
                     send_len = CONFIG_MQTT_BUFFER_SIZE_BYTE;
+		}
                 ESP_LOGD(TAG,"Sending %d bytes", send_len);
 
+                // blocking operation, takes data from ring buffer
                 rb_read(&client->send_rb, client->mqtt_state.out_buffer, send_len);
                 client->mqtt_state.pending_msg_type = mqtt_get_type(client->mqtt_state.out_buffer);
                 client->mqtt_state.pending_msg_id = mqtt_get_id(client->mqtt_state.out_buffer, send_len);
@@ -378,6 +380,7 @@ void mqtt_sending_task(void *pvParameters)
     }
 //    _mqtt_mbedtls_close(client);
     xMqttSendingTask = NULL;
+    ESP_LOGD(TAG, "mqtt_sending_task destroy");
     vTaskDelete(NULL);
 }
 
@@ -581,6 +584,11 @@ void mqtt_task(void *pvParameters)
             ESP_LOGD(TAG, "About to auto_reconnect");
 			break;
 		}
+
+        // clean up for new reconnect
+        xQueueReset(client->xSendingQueue);
+        rb_reset(&client->send_rb);
+
         vTaskDelay(1000 / portTICK_RATE_MS);
 
     }
