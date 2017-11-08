@@ -15,6 +15,9 @@
 #include "lwip/netdb.h"
 #include "ringbuf.h"
 #include "mqtt.h"
+#include "esp_log.h"
+
+#define TAG "MQTT"
 
 static TaskHandle_t xMqttTask = NULL;
 static TaskHandle_t xMqttSendingTask = NULL;
@@ -56,67 +59,53 @@ static bool client_connect(mqtt_client *client)
         remote_ip.sin_port = htons(client->settings->port);
 
 
-        //if host is not ip address, resolve it
-        if (inet_aton( client->settings->host, &(remote_ip.sin_addr)) == 0) {
-            mqtt_info("Resolve dns for domain: %s", client->settings->host);
-
-            if (!resolve_dns(client->settings->host, &remote_ip)) {
-                vTaskDelay(1000 / portTICK_RATE_MS);
-                continue;
-            }
-        }
-
-
-#if defined(CONFIG_MQTT_SECURITY_ON)  // ENABLE MQTT OVER SSL
-        client->ctx = NULL;
-        client->ssl = NULL;
-
-        client->ctx = SSL_CTX_new(TLSv1_2_client_method());
-        if (!client->ctx) {
-            mqtt_error("Failed to create SSL CTX");
-            goto failed1;
-        }
-#endif
+	if(ret != 0) {
+		char *buf = malloc(100);
+		mbedtls_strerror(ret, buf, 100);
+		ESP_LOGE(TAG, "Last error was: -0x%x - %s", -ret, buf);
+		free(buf);
+	}
+}
 
         client->socket = socket(PF_INET, SOCK_STREAM, 0);
         if (client->socket == -1) {
-            mqtt_error("Failed to create socket");
+            ESP_LOGE("MQTT","Failed to create socket");
             goto failed2;
         }
 
 
 
-        mqtt_info("Connecting to server %s:%d,%d",
+        ESP_LOGI("MQTT","Connecting to server %s:%d,%d",
                   inet_ntoa((remote_ip.sin_addr)),
                   client->settings->port,
                   remote_ip.sin_port);
 
 
         if (connect(client->socket, (struct sockaddr *)(&remote_ip), sizeof(struct sockaddr)) != 00) {
-            mqtt_error("Connect failed");
+            ESP_LOGE("MQTT","Connect failed");
             goto failed3;
         }
 
 #if defined(CONFIG_MQTT_SECURITY_ON)  // ENABLE MQTT OVER SSL
-        mqtt_info("Creating SSL object...");
+        ESP_LOGI("MQTT","Creating SSL object...");
         client->ssl = SSL_new(client->ctx);
         if (!client->ssl) {
-            mqtt_error("Unable to creat new SSL");
+            ESP_LOGE("MQTT","Unable to creat new SSL");
             goto failed3;
         }
 
         if (!SSL_set_fd(client->ssl, client->socket)) {
-            mqtt_error("SSL set_fd failed");
+            ESP_LOGE("MQTT","SSL set_fd failed");
             goto failed3;
         }
 
-        mqtt_info("Start SSL connect..");
+        ESP_LOGI("MQTT","Start SSL connect..");
         if (!SSL_connect(client->ssl)) {
-            mqtt_error("SSL Connect FAILED");
+            ESP_LOGE("MQTT","SSL Connect FAILED");
             goto failed4;
         }
 #endif
-        mqtt_info("Connected!");
+        ESP_LOGI("MQTT","Connected!");
 
         return true;
 
@@ -150,7 +139,7 @@ static bool client_connect(mqtt_client *client)
 // including SSL objects if CNFIG_MQTT_SECURITY_ON is enabled
 void closeclient(mqtt_client *client)
 {
-    mqtt_info("Closing client socket");
+    ESP_LOGI("MQTT","Closing client socket");
 
     if (client->socket != -1)
 	{
@@ -252,7 +241,7 @@ static bool mqtt_connect(mqtt_client *client)
     client->mqtt_state.pending_msg_type = mqtt_get_type(client->mqtt_state.outbound_message->data);
     client->mqtt_state.pending_msg_id = mqtt_get_id(client->mqtt_state.outbound_message->data,
                                         client->mqtt_state.outbound_message->length);
-    mqtt_info("Sending MQTT CONNECT message, type: %d, id: %04X",
+    ESP_LOGI(TAG,"Sending MQTT CONNECT message, type: %d, id: %04X",
               client->mqtt_state.pending_msg_type,
               client->mqtt_state.pending_msg_id);
 
@@ -260,41 +249,41 @@ static bool mqtt_connect(mqtt_client *client)
                       client->mqtt_state.outbound_message->data,
                       client->mqtt_state.outbound_message->length, 0);
     if(write_len < 0) {
-        mqtt_error("Writing failed: %d", errno);
+        ESP_LOGE(TAG,"Writing failed: %d", errno);
         return false;
     }
 
-    mqtt_info("Reading MQTT CONNECT response message");
+    ESP_LOGI(TAG,"Reading MQTT CONNECT response message");
 
     read_len = client->settings->read_cb(client, client->mqtt_state.in_buffer, CONFIG_MQTT_BUFFER_SIZE_BYTE, 10 * 1000);
 
     if (read_len < 0) {
-        mqtt_error("Error network response");
+        ESP_LOGE(TAG,"Error network response");
         return false;
     }
     if (mqtt_get_type(client->mqtt_state.in_buffer) != MQTT_MSG_TYPE_CONNACK) {
-        mqtt_error("Invalid MSG_TYPE response: %d, read_len: %d", mqtt_get_type(client->mqtt_state.in_buffer), read_len);
+        ESP_LOGE(TAG,"Invalid MSG_TYPE response: %d, read_len: %d", mqtt_get_type(client->mqtt_state.in_buffer), read_len);
         return false;
     }
     connect_rsp_code = mqtt_get_connect_return_code(client->mqtt_state.in_buffer);
     switch (connect_rsp_code) {
         case CONNECTION_ACCEPTED:
-            mqtt_info("Connected");
+            ESP_LOGI(TAG,"Connected");
             return true;
         case CONNECTION_REFUSE_PROTOCOL:
-            mqtt_warn("Connection refused, bad protocol");
+            ESP_LOGW(TAG,"Connection refused, bad protocol");
             return false;
         case CONNECTION_REFUSE_SERVER_UNAVAILABLE:
-            mqtt_warn("Connection refused, server unavailable");
+            ESP_LOGW(TAG,"Connection refused, server unavailable");
             return false;
         case CONNECTION_REFUSE_BAD_USERNAME:
-            mqtt_warn("Connection refused, bad username or password");
+            ESP_LOGW(TAG,"Connection refused, bad username or password");
             return false;
         case CONNECTION_REFUSE_NOT_AUTHORIZED:
-            mqtt_warn("Connection refused, not authorized");
+            ESP_LOGW(TAG,"Connection refused, not authorized");
             return false;
         default:
-            mqtt_warn("Connection refused, Unknow reason");
+            ESP_LOGW(TAG,"Connection refused, Unknow reason");
             return false;
     }
     return false;
@@ -306,7 +295,7 @@ void mqtt_sending_task(void *pvParameters)
     uint32_t msg_len;
     int send_len;
     bool connected = true;
-    mqtt_info("mqtt_sending_task");
+    ESP_LOGI(TAG,"mqtt_sending_task");
 
     while (connected) {
         if (xQueueReceive(client->xSendingQueue, &msg_len, 1000 / portTICK_RATE_MS)) {
@@ -315,14 +304,14 @@ void mqtt_sending_task(void *pvParameters)
                 send_len = msg_len;
                 if (send_len > CONFIG_MQTT_BUFFER_SIZE_BYTE)
                     send_len = CONFIG_MQTT_BUFFER_SIZE_BYTE;
-                mqtt_info("Sending...%d bytes", send_len);
+                ESP_LOGI(TAG,"Sending...%d bytes", send_len);
 
                 rb_read(&client->send_rb, client->mqtt_state.out_buffer, send_len);
                 client->mqtt_state.pending_msg_type = mqtt_get_type(client->mqtt_state.out_buffer);
                 client->mqtt_state.pending_msg_id = mqtt_get_id(client->mqtt_state.out_buffer, send_len);
                 send_len = client->settings->write_cb(client, client->mqtt_state.out_buffer, send_len, 5 * 1000);
                 if(send_len <= 0) {
-                    mqtt_info("Write error: %d", errno);
+                    ESP_LOGI(TAG,"Write error: %d", errno);
                     connected = false;
                     break;
                 }
@@ -341,12 +330,12 @@ void mqtt_sending_task(void *pvParameters)
                 client->mqtt_state.pending_msg_type = mqtt_get_type(client->mqtt_state.outbound_message->data);
                 client->mqtt_state.pending_msg_id = mqtt_get_id(client->mqtt_state.outbound_message->data,
                                                     client->mqtt_state.outbound_message->length);
-                mqtt_info("Sending pingreq");
+                ESP_LOGI(TAG,"Sending pingreq");
                 send_len = client->settings->write_cb(client,
                       client->mqtt_state.outbound_message->data,
                       client->mqtt_state.outbound_message->length, 0);
                 if(send_len <= 0) {
-					mqtt_info("Write error: %d", errno);
+					ESP_LOGI(TAG,"Write error: %d", errno);
                     connected = false;
 					break;
 				}
@@ -381,7 +370,7 @@ void deliver_publish(mqtt_client *client, uint8_t *message, int length)
         event_data.data_offset = mqtt_offset;
         event_data.data_length = mqtt_len;
 
-        mqtt_info("Data received: %d/%d bytes ", mqtt_len, total_mqtt_len);
+        ESP_LOGI(TAG,"Data received: %d/%d bytes ", mqtt_len, total_mqtt_len);
         if(client->settings->data_cb) {
             client->settings->data_cb(client, &event_data);
         }
@@ -391,7 +380,7 @@ void deliver_publish(mqtt_client *client, uint8_t *message, int length)
 
         len_read = client->settings->read_cb(client, client->mqtt_state.in_buffer, CONFIG_MQTT_BUFFER_SIZE_BYTE, 0);
         if(len_read < 0) {
-            mqtt_info("Read error: %d", errno);
+            ESP_LOGI(TAG,"Read error: %d", errno);
             break;
         }
         client->mqtt_state.message_length_read += len_read;
@@ -412,22 +401,22 @@ void mqtt_start_receive_schedule(mqtt_client *client)
 
         read_len = client->settings->read_cb(client, client->mqtt_state.in_buffer, CONFIG_MQTT_BUFFER_SIZE_BYTE, 0);
 
-        mqtt_info("Read len %d", read_len);
+        ESP_LOGI(TAG,"Read len %d", read_len);
         if (read_len <= 0) {
             // ECONNRESET for example
-            mqtt_info("Read error %d", errno);
+            ESP_LOGI(TAG,"Read error %d", errno);
             break;
         }
 
         msg_type = mqtt_get_type(client->mqtt_state.in_buffer);
         msg_qos = mqtt_get_qos(client->mqtt_state.in_buffer);
         msg_id = mqtt_get_id(client->mqtt_state.in_buffer, client->mqtt_state.in_buffer_length);
-        // mqtt_info("msg_type %d, msg_id: %d, pending_id: %d", msg_type, msg_id, client->mqtt_state.pending_msg_type);
+        // ESP_LOGI(TAG,"msg_type %d, msg_id: %d, pending_id: %d", msg_type, msg_id, client->mqtt_state.pending_msg_type);
         switch (msg_type)
         {
             case MQTT_MSG_TYPE_SUBACK:
                 if (client->mqtt_state.pending_msg_type == MQTT_MSG_TYPE_SUBSCRIBE && client->mqtt_state.pending_msg_id == msg_id) {
-                    mqtt_info("Subscribe successful");
+                    ESP_LOGI(TAG,"Subscribe successful");
                     if (client->settings->subscribe_cb) {
                         client->settings->subscribe_cb(client, NULL);
                     }
@@ -435,7 +424,7 @@ void mqtt_start_receive_schedule(mqtt_client *client)
                 break;
             case MQTT_MSG_TYPE_UNSUBACK:
                 if (client->mqtt_state.pending_msg_type == MQTT_MSG_TYPE_UNSUBSCRIBE && client->mqtt_state.pending_msg_id == msg_id)
-                    mqtt_info("UnSubscribe successful");
+                    ESP_LOGI(TAG,"UnSubscribe successful");
                 break;
             case MQTT_MSG_TYPE_PUBLISH:
                 if (msg_qos == 1)
@@ -444,22 +433,22 @@ void mqtt_start_receive_schedule(mqtt_client *client)
                     client->mqtt_state.outbound_message = mqtt_msg_pubrec(&client->mqtt_state.mqtt_connection, msg_id);
 
                 if (msg_qos == 1 || msg_qos == 2) {
-                    mqtt_info("Queue response QoS: %d", msg_qos);
+                    ESP_LOGI(TAG,"Queue response QoS: %d", msg_qos);
                     mqtt_queue(client);
                     // if (QUEUE_Puts(&client->msgQueue, client->mqtt_state.outbound_message->data, client->mqtt_state.outbound_message->length) == -1) {
-                    //     mqtt_info("MQTT: Queue full");
+                    //     ESP_LOGI(TAG,"MQTT: Queue full");
                     // }
                 }
                 client->mqtt_state.message_length_read = read_len;
                 client->mqtt_state.message_length = mqtt_get_total_length(client->mqtt_state.in_buffer, client->mqtt_state.message_length_read);
-                mqtt_info("deliver_publish");
+                ESP_LOGI(TAG,"deliver_publish");
 
                 deliver_publish(client, client->mqtt_state.in_buffer, client->mqtt_state.message_length_read);
                 // deliver_publish(client, client->mqtt_state.in_buffer, client->mqtt_state.message_length_read);
                 break;
             case MQTT_MSG_TYPE_PUBACK:
                 if (client->mqtt_state.pending_msg_type == MQTT_MSG_TYPE_PUBLISH && client->mqtt_state.pending_msg_id == msg_id) {
-                    mqtt_info("received MQTT_MSG_TYPE_PUBACK, finish QoS1 publish");
+                    ESP_LOGI(TAG,"received MQTT_MSG_TYPE_PUBACK, finish QoS1 publish");
                 }
 
                 break;
@@ -474,7 +463,7 @@ void mqtt_start_receive_schedule(mqtt_client *client)
                 break;
             case MQTT_MSG_TYPE_PUBCOMP:
                 if (client->mqtt_state.pending_msg_type == MQTT_MSG_TYPE_PUBREL && client->mqtt_state.pending_msg_id == msg_id) {
-                    mqtt_info("Receive MQTT_MSG_TYPE_PUBCOMP, finish QoS2 publish");
+                    ESP_LOGI(TAG,"Receive MQTT_MSG_TYPE_PUBCOMP, finish QoS2 publish");
                 }
                 break;
             case MQTT_MSG_TYPE_PINGREQ:
@@ -482,7 +471,7 @@ void mqtt_start_receive_schedule(mqtt_client *client)
                 mqtt_queue(client);
                 break;
             case MQTT_MSG_TYPE_PINGRESP:
-                mqtt_info("MQTT_MSG_TYPE_PINGRESP");
+                ESP_LOGI(TAG,"MQTT_MSG_TYPE_PINGRESP");
                 // Ignore
                 break;
         }
@@ -500,12 +489,12 @@ void mqtt_destroy(mqtt_client *client)
     free(client->send_rb.p_o);
     free(client);
 
-    mqtt_info("Client destroyed");
+    ESP_LOGI(TAG,"Client destroyed");
 }
 
 void mqtt_task(void *pvParameters)
 {
-    mqtt_info("Starting mqtt task");
+    ESP_LOGI(TAG,"Starting mqtt task");
 
     mqtt_client *client = (mqtt_client *)pvParameters;
 
@@ -514,7 +503,7 @@ void mqtt_task(void *pvParameters)
 
         client->settings->connect_cb(client);
 
-        mqtt_info("Connected to server %s:%d", client->settings->host, client->settings->port);
+        ESP_LOGI(TAG,"Connected to server %s:%s", client->settings->host, client->settings->port);
         if (!mqtt_connect(client)) {
             client->settings->disconnect_cb(client);
 
@@ -528,13 +517,13 @@ void mqtt_task(void *pvParameters)
 				continue;
 			}
         }
-        mqtt_info("Connected to MQTT broker, create sending thread before call connected callback");
+        ESP_LOGI(TAG,"Connected to MQTT broker, create sending thread before call connected callback");
         xTaskCreate(&mqtt_sending_task, "mqtt_sending_task", 2048, client, CONFIG_MQTT_PRIORITY + 1, &xMqttSendingTask);
         if (client->settings->connected_cb) {
             client->settings->connected_cb(client, NULL);
         }
 
-        mqtt_info("mqtt_start_receive_schedule");
+        ESP_LOGI(TAG,"mqtt_start_receive_schedule");
         mqtt_start_receive_schedule(client);
 
         client->settings->disconnect_cb(client);
@@ -569,13 +558,13 @@ mqtt_client *mqtt_start(mqtt_settings *settings)
     mqtt_client *client = malloc(sizeof(mqtt_client));
 
     if (client == NULL) {
-        mqtt_error("Memory not enough");
+        ESP_LOGE(TAG,"Memory not enough");
         return NULL;
     }
     memset(client, 0, sizeof(mqtt_client));
 
     if (settings->lwt_msg_len > CONFIG_MQTT_MAX_LWT_MSG) {
-        mqtt_error("Last will message longer than CONFIG_MQTT_MAX_LWT_MSG!");
+        ESP_LOGE(TAG,"Last will message longer than CONFIG_MQTT_MAX_LWT_MSG!");
     }
 
     client->settings = settings;
@@ -621,7 +610,7 @@ mqtt_client *mqtt_start(mqtt_settings *settings)
     rb_buf = (uint8_t*) malloc(CONFIG_MQTT_QUEUE_BUFFER_SIZE_WORD * 4);
 
     if (rb_buf == NULL) {
-        mqtt_error("Memory not enough");
+        ESP_LOGE(TAG,"Memory not enough");
         return NULL;
     }
 
@@ -640,7 +629,7 @@ void mqtt_subscribe(mqtt_client *client, const char *topic, uint8_t qos)
     client->mqtt_state.outbound_message = mqtt_msg_subscribe(&client->mqtt_state.mqtt_connection,
                                           topic, qos,
                                           &client->mqtt_state.pending_msg_id);
-    mqtt_info("Queue subscribe, topic\"%s\", id: %d", topic, client->mqtt_state.pending_msg_id);
+    ESP_LOGI(TAG,"Queue subscribe, topic\"%s\", id: %d", topic, client->mqtt_state.pending_msg_id);
     mqtt_queue(client);
 }
 
@@ -650,7 +639,7 @@ void mqtt_unsubscribe(mqtt_client *client, const char *topic)
 	client->mqtt_state.outbound_message = mqtt_msg_unsubscribe(&client->mqtt_state.mqtt_connection,
 	                                          topic,
 	                                          &client->mqtt_state.pending_msg_id);
-	mqtt_info("Queue unsubscribe, topic\"%s\", id: %d", topic, client->mqtt_state.pending_msg_id);
+	ESP_LOGI(TAG,"Queue unsubscribe, topic\"%s\", id: %d", topic, client->mqtt_state.pending_msg_id);
 	mqtt_queue(client);
 }
 
@@ -662,7 +651,7 @@ void mqtt_publish(mqtt_client* client, const char *topic, const char *data, int 
                                           qos, retain,
                                           &client->mqtt_state.pending_msg_id);
     mqtt_queue(client);
-    mqtt_info("Queuing publish, length: %d, queue size(%d/%d)",
+    ESP_LOGI(TAG,"Queuing publish, length: %d, queue size(%d/%d)",
               client->mqtt_state.outbound_message->length,
               client->send_rb.fill_cnt,
               client->send_rb.size);
