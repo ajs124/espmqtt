@@ -7,9 +7,8 @@
 #include "mqtt_msg.h"
 #include "ringbuf.h"
 
-#if defined(CONFIG_MQTT_SECURITY_ON)
-#include "openssl/ssl.h"
-#endif
+#include "mbedtls/ssl.h"
+#include "mbedtls/net_sockets.h"
 
 typedef struct mqtt_client mqtt_client;
 typedef struct mqtt_event_data_t mqtt_event_data_t;
@@ -52,7 +51,7 @@ typedef struct mqtt_settings {
     mqtt_event_callback data_cb;
 
     char host[CONFIG_MQTT_MAX_HOST_LEN];
-    uint32_t port;
+    char port[10];
     char client_id[CONFIG_MQTT_MAX_CLIENT_LEN];
     char username[CONFIG_MQTT_MAX_USERNAME_LEN];
     char password[CONFIG_MQTT_MAX_PASSWORD_LEN];
@@ -96,12 +95,8 @@ typedef struct mqtt_state_t
 } mqtt_state_t;
 
 typedef struct mqtt_client {
-  int socket;
-
-#if defined(CONFIG_MQTT_SECURITY_ON)  // ENABLE MQTT OVER SSL
-  SSL_CTX *ctx;
-  SSL *ssl;
-#endif
+  mbedtls_ssl_context ssl;
+  mbedtls_net_context server_fd;
 
   mqtt_settings *settings;
   mqtt_state_t  mqtt_state;
