@@ -40,7 +40,9 @@ static bool terminate_mqtt = false;
 static bool mbedtls_initialized = false;
 
 void _mqtt_mbedtls_cleanup(mqtt_client *client, int ret) {
-	mbedtls_ssl_session_reset(&client->ssl);
+	if(&client->ssl != NULL) {
+		mbedtls_ssl_session_reset(&client->ssl);
+	}
 	mbedtls_net_free(&client->server_fd);
 
 	if(ret != 0) {
@@ -51,13 +53,16 @@ void _mqtt_mbedtls_cleanup(mqtt_client *client, int ret) {
 	}
 }
 
-void _mqtt_close_connection(mqtt_client *client) {
-    ESP_LOGD(TAG, "Closing client socket");
-	mbedtls_ssl_close_notify(&client->ssl);
-	_mqtt_mbedtls_cleanup(client, 0);
+void _mqtt_mbedtls_close(mqtt_client *client) {
+    ESP_LOGD(TAG, "_mqtt_mbedtls_close called in task: %s", pcTaskGetTaskName(NULL));
+	if(&client->ssl != NULL) {
+		mbedtls_ssl_close_notify(&client->ssl);
+		mbedtls_ssl_session_reset(&client->ssl);
+	}
+	ESP_LOGD(TAG, "_mqtt_mbedtls_close about to return");
 }
 
-static bool _mqtt_client_connect(mqtt_client *client) {
+static bool _mqtt_mbedtls_connect(mqtt_client *client) {
 	int ret, flags;
 //	if(client->server_fd.fd < 0) {
         mbedtls_net_init(&client->server_fd);
@@ -176,7 +181,7 @@ static void mqtt_queue(mqtt_client *client) {
     xQueueSend(client->xSendingQueue, &client->mqtt_state.outbound_message->length, 0);
 }
 
-int mqtt_read(mqtt_client *client, void *buf, int len, int timeout_ms) {
+int _mqtt_mbedtls_read(mqtt_client *client, void *buf, int len, int timeout_ms) {
     int ret;
     struct timeval tv;
     if (timeout_ms > 0) {
@@ -196,14 +201,14 @@ int mqtt_read(mqtt_client *client, void *buf, int len, int timeout_ms) {
 		ESP_LOGD(TAG, "there is more data to be read (or written?)");
 	} else if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
 		ESP_LOGD(TAG, "tls connection is about to be closed");
-		return 0;
+		return -1;
 	} else if (ret < 0) {
 		ESP_LOGE(TAG, "mbedtls_ssl_read returned -0x%x", -ret);
-		return -1;
+		return -2;
 	} else if (ret == 0) {
 		ESP_LOGI(TAG, "connection closed");
-		_mqtt_close_connection(client);
-		return -2;
+		_mqtt_mbedtls_close(client);
+		return -3;
 	}
 
     if (timeout_ms > 0) {
@@ -215,8 +220,7 @@ int mqtt_read(mqtt_client *client, void *buf, int len, int timeout_ms) {
     return ret;
 }
 
-int mqtt_write(mqtt_client *client, const void *buffer, int len, int timeout_ms)
-{
+int _mqtt_mbedtls_write(mqtt_client *client, const void *buffer, int len, int timeout_ms) {
     int result;
     size_t written_bytes = 0;
     struct timeval tv;
@@ -232,6 +236,7 @@ int mqtt_write(mqtt_client *client, const void *buffer, int len, int timeout_ms)
 
 	ESP_LOGD(TAG, "Sending %d bytes of data", len);
 	do {
+		if(&client->ssl == NULL) return written_bytes;
 		result = mbedtls_ssl_write(&client->ssl, (const unsigned char *) buffer + written_bytes, len - written_bytes);
 		if (result >= 0) {
 			ESP_LOGD(TAG, "%d bytes written", result);
@@ -371,7 +376,7 @@ void mqtt_sending_task(void *pvParameters)
             }
         }
     }
-    _mqtt_close_connection(client);
+//    _mqtt_mbedtls_close(client);
     xMqttSendingTask = NULL;
     vTaskDelete(NULL);
 }
@@ -424,7 +429,6 @@ void mqtt_start_receive_schedule(mqtt_client *client)
     uint16_t msg_id;
 
     while (1) {
-
     	if (terminate_mqtt) break;
     	if (xMqttSendingTask == NULL) break;
 
@@ -433,7 +437,7 @@ void mqtt_start_receive_schedule(mqtt_client *client)
         ESP_LOGD(TAG, "%d bytes read", read_len);
         if (read_len <= 0) {
             // ECONNRESET for example
-            ESP_LOGW(TAG,"Read error %d", errno);
+            ESP_LOGW(TAG, "Read error %d", read_len);
             break;
         }
 
@@ -511,7 +515,6 @@ void mqtt_destroy(mqtt_client *client)
 {
 	if (client == NULL) return;
 
-	_mqtt_close_connection(client);
 	vQueueDelete(client->xSendingQueue);
 
     free(client->mqtt_state.in_buffer);
@@ -528,8 +531,6 @@ void mqtt_task(void *pvParameters)
 
     mqtt_client *client = (mqtt_client *)pvParameters;
 
-    /* FIXME: Does this leak?
-     * These aren't freed manually and I'm still not 100% clear on the execution flow of all of this. */
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_x509_crt cacert;
@@ -555,7 +556,7 @@ void mqtt_task(void *pvParameters)
 				continue;
 			}
         }
-        ESP_LOGI(TAG,"Connected to MQTT broker, create sending thread before call connected callback");
+        ESP_LOGI(TAG,"Connected to MQTT broker, creating sending thread before calling connected callback");
         xTaskCreate(&mqtt_sending_task, "mqtt_sending_task", 2048, client, CONFIG_MQTT_PRIORITY + 1, &xMqttSendingTask);
         if (client->settings->connected_cb) {
             client->settings->connected_cb(client, NULL);
@@ -564,15 +565,20 @@ void mqtt_task(void *pvParameters)
         ESP_LOGI(TAG,"mqtt_start_receive_schedule");
         mqtt_start_receive_schedule(client);
 
+        ESP_LOGD(TAG, "wat?");
         client->settings->disconnect_cb(client);
+        ESP_LOGD(TAG, "srsly");
         if (client->settings->disconnected_cb) {
         	client->settings->disconnected_cb(client, NULL);
 		}
 
+/*      FIXME: This hardlocks the µC
         if (xMqttSendingTask != NULL) {
-        	vTaskDelete(xMqttSendingTask);
-        }
+            ESP_LOGD(TAG, "Will delete sending task from mqtt_task");
+            vTaskDelete(xMqttSendingTask);
+        }*/
         if (!client->settings->auto_reconnect) {
+            ESP_LOGD(TAG, "About to auto_reconnect");
 			break;
 		}
         vTaskDelay(1000 / portTICK_RATE_MS);
@@ -580,6 +586,11 @@ void mqtt_task(void *pvParameters)
     }
 
     mqtt_destroy(client);
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_x509_crt_free(&cacert);
+    mbedtls_ssl_config_free(&conf);
+
     xMqttTask = NULL;
     vTaskDelete(NULL);
 }
@@ -625,13 +636,13 @@ mqtt_client *mqtt_start(mqtt_settings *settings)
     client->mqtt_state.connect_info = &client->connect_info;
 
     if (!client->settings->connect_cb)
-        client->settings->connect_cb = _mqtt_client_connect;
+        client->settings->connect_cb = _mqtt_mbedtls_connect;
     if (!client->settings->disconnect_cb)
-        client->settings->disconnect_cb = _mqtt_close_connection;
+        client->settings->disconnect_cb = _mqtt_mbedtls_close;
     if (!client->settings->read_cb)
-        client->settings->read_cb = mqtt_read;
+        client->settings->read_cb = _mqtt_mbedtls_read;
     if (!client->settings->write_cb)
-        client->settings->write_cb = mqtt_write;
+        client->settings->write_cb = _mqtt_mbedtls_write;
 
     /* Create a queue capable of containing 64 unsigned long values. */
     client->xSendingQueue = xQueueCreate(64, sizeof( uint32_t ));
